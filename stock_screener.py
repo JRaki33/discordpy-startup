@@ -2,7 +2,6 @@
 低位株スクリーナー
 東証上場の低位株（株価500円未満など）をスクリーニングして分析する
 """
-import asyncio
 from typing import Optional
 from stock_analyzer import analyze_stock, StockAnalysis, format_analysis
 
@@ -48,6 +47,7 @@ def screen_low_price_stocks(
     max_price: float = 1000.0,
     min_rise_probability: float = 60.0,
     top_n: int = 5,
+    weights: Optional[dict] = None,
 ) -> list[StockAnalysis]:
     """
     低位株をスクリーニングして上昇確率の高い銘柄を返す
@@ -57,13 +57,14 @@ def screen_low_price_stocks(
         max_price: この価格以下の銘柄だけ対象 (低位株フィルター)
         min_rise_probability: 上昇確率の足切りライン
         top_n: 返す件数
+        weights: シグナル重み辞書（prediction_db から取得）
     """
     if watchlist is None:
         watchlist = DEFAULT_WATCHLIST
 
     results = []
     for ticker in watchlist:
-        analysis = analyze_stock(ticker)
+        analysis = analyze_stock(ticker, weights=weights)
         if analysis is None:
             continue
         if analysis.current_price > max_price:
@@ -72,7 +73,6 @@ def screen_low_price_stocks(
             continue
         results.append(analysis)
 
-    # 上昇確率の高い順にソート
     results.sort(key=lambda x: x.rise_probability, reverse=True)
     return results[:top_n]
 
@@ -81,6 +81,7 @@ def screen_reversal_stocks(
     watchlist: list[str] = None,
     max_price: float = 1000.0,
     top_n: int = 5,
+    weights: Optional[dict] = None,
 ) -> list[StockAnalysis]:
     """
     反転シグナルが出ている低位株を返す
@@ -89,13 +90,14 @@ def screen_reversal_stocks(
         watchlist: 対象ティッカーリスト
         max_price: 低位株フィルター
         top_n: 返す件数
+        weights: シグナル重み辞書
     """
     if watchlist is None:
         watchlist = DEFAULT_WATCHLIST
 
     results = []
     for ticker in watchlist:
-        analysis = analyze_stock(ticker)
+        analysis = analyze_stock(ticker, weights=weights)
         if analysis is None:
             continue
         if analysis.current_price > max_price:
