@@ -1,13 +1,11 @@
 """
-低位株スクリーナー
-東証上場の低位株（株価500円未満など）をスクリーニングして分析する
+株式スクリーナー
+日本株（東証）・米株（NYSE/NASDAQ）の低位株をスクリーニングして分析する
 """
 from typing import Optional
 from stock_analyzer import analyze_stock, StockAnalysis, format_analysis
 
-# ---- 低位株として監視するデフォルト銘柄リスト ----
-# 株価が比較的低い東証銘柄を初期値として設定（ユーザーが自由に変更可）
-# yfinance形式: コード + ".T"
+# ---- 日本株デフォルト監視リスト ----
 DEFAULT_WATCHLIST = [
     "1301.T",  # 極洋
     "1332.T",  # 日本水産
@@ -18,8 +16,7 @@ DEFAULT_WATCHLIST = [
     "4004.T",  # レゾナック
     "4061.T",  # デンカ
     "4202.T",  # ダイセル
-    "4208.T",  # 宇部興産→UBE
-    "4217.T",  # 日立化成→昭和電工M
+    "4208.T",  # UBE
     "4401.T",  # ADEKA
     "5020.T",  # ENEOSホールディングス
     "5201.T",  # AGC
@@ -41,6 +38,73 @@ DEFAULT_WATCHLIST = [
     "9107.T",  # 川崎汽船
 ]
 
+# ---- 米株デフォルト監視リスト（低価格帯〜中価格帯の流動性の高い銘柄） ----
+DEFAULT_US_WATCHLIST = [
+    # テクノロジー
+    "INTC",   # Intel
+    "CSCO",   # Cisco
+    "HPQ",    # HP Inc.
+    "DELL",   # Dell Technologies
+    "STX",    # Seagate Technology
+    "WDC",    # Western Digital
+    "SNAP",   # Snap
+    "PINS",   # Pinterest
+    "OPEN",   # Opendoor Technologies
+    # 金融
+    "BAC",    # Bank of America
+    "WFC",    # Wells Fargo
+    "C",      # Citigroup
+    "USB",    # U.S. Bancorp
+    "RF",     # Regions Financial
+    "KEY",    # KeyCorp
+    "FITB",   # Fifth Third Bancorp
+    # エネルギー
+    "XOM",    # ExxonMobil
+    "CVX",    # Chevron
+    "OXY",    # Occidental Petroleum
+    "MRO",    # Marathon Oil
+    "DVN",    # Devon Energy
+    # 素材・工業
+    "FCX",    # Freeport-McMoRan（銅）
+    "CLF",    # Cleveland-Cliffs（鉄鋼）
+    "X",      # US Steel
+    "AA",     # Alcoa（アルミ）
+    "NUE",    # Nucor
+    # 消費財・小売
+    "F",      # Ford Motor
+    "GM",     # General Motors
+    "M",      # Macy's
+    "KHC",    # Kraft Heinz
+    "PFE",    # Pfizer
+]
+
+
+def _screen(
+    watchlist: list[str],
+    max_price: float,
+    min_rise_probability: float,
+    top_n: int,
+    weights: Optional[dict],
+    reversal_only: bool,
+) -> list[StockAnalysis]:
+    """スクリーニング共通ロジック"""
+    results = []
+    for ticker in watchlist:
+        analysis = analyze_stock(ticker, weights=weights)
+        if analysis is None:
+            continue
+        if analysis.current_price > max_price:
+            continue
+        if reversal_only:
+            if not analysis.reversal_detected:
+                continue
+        else:
+            if analysis.rise_probability < min_rise_probability:
+                continue
+        results.append(analysis)
+    results.sort(key=lambda x: x.rise_probability, reverse=True)
+    return results[:top_n]
+
 
 def screen_low_price_stocks(
     watchlist: list[str] = None,
@@ -49,32 +113,11 @@ def screen_low_price_stocks(
     top_n: int = 5,
     weights: Optional[dict] = None,
 ) -> list[StockAnalysis]:
-    """
-    低位株をスクリーニングして上昇確率の高い銘柄を返す
-
-    Args:
-        watchlist: 対象ティッカーリスト (None でデフォルト)
-        max_price: この価格以下の銘柄だけ対象 (低位株フィルター)
-        min_rise_probability: 上昇確率の足切りライン
-        top_n: 返す件数
-        weights: シグナル重み辞書（prediction_db から取得）
-    """
-    if watchlist is None:
-        watchlist = DEFAULT_WATCHLIST
-
-    results = []
-    for ticker in watchlist:
-        analysis = analyze_stock(ticker, weights=weights)
-        if analysis is None:
-            continue
-        if analysis.current_price > max_price:
-            continue
-        if analysis.rise_probability < min_rise_probability:
-            continue
-        results.append(analysis)
-
-    results.sort(key=lambda x: x.rise_probability, reverse=True)
-    return results[:top_n]
+    """日本株の低位株をスクリーニングして上昇確率上位を返す"""
+    return _screen(
+        watchlist or DEFAULT_WATCHLIST,
+        max_price, min_rise_probability, top_n, weights, reversal_only=False,
+    )
 
 
 def screen_reversal_stocks(
@@ -83,82 +126,88 @@ def screen_reversal_stocks(
     top_n: int = 5,
     weights: Optional[dict] = None,
 ) -> list[StockAnalysis]:
-    """
-    反転シグナルが出ている低位株を返す
+    """日本株の反転シグナル銘柄を返す"""
+    return _screen(
+        watchlist or DEFAULT_WATCHLIST,
+        max_price, 0, top_n, weights, reversal_only=True,
+    )
 
-    Args:
-        watchlist: 対象ティッカーリスト
-        max_price: 低位株フィルター
-        top_n: 返す件数
-        weights: シグナル重み辞書
-    """
-    if watchlist is None:
-        watchlist = DEFAULT_WATCHLIST
 
-    results = []
-    for ticker in watchlist:
-        analysis = analyze_stock(ticker, weights=weights)
-        if analysis is None:
-            continue
-        if analysis.current_price > max_price:
-            continue
-        if not analysis.reversal_detected:
-            continue
-        results.append(analysis)
+def screen_us_low_price_stocks(
+    watchlist: list[str] = None,
+    max_price: float = 50.0,
+    min_rise_probability: float = 60.0,
+    top_n: int = 5,
+    weights: Optional[dict] = None,
+) -> list[StockAnalysis]:
+    """米株の低位株をスクリーニングして上昇確率上位を返す（デフォルト$50以下）"""
+    return _screen(
+        watchlist or DEFAULT_US_WATCHLIST,
+        max_price, min_rise_probability, top_n, weights, reversal_only=False,
+    )
 
-    results.sort(key=lambda x: x.rise_probability, reverse=True)
-    return results[:top_n]
+
+def screen_us_reversal_stocks(
+    watchlist: list[str] = None,
+    max_price: float = 50.0,
+    top_n: int = 5,
+    weights: Optional[dict] = None,
+) -> list[StockAnalysis]:
+    """米株の反転シグナル銘柄を返す"""
+    return _screen(
+        watchlist or DEFAULT_US_WATCHLIST,
+        max_price, 0, top_n, weights, reversal_only=True,
+    )
+
+
+def _format_stock_section(stocks: list[StockAnalysis], label: str) -> list[str]:
+    lines = [f"## {label}"]
+    if stocks:
+        for i, s in enumerate(stocks, 1):
+            price_str = f"${s.current_price:,.2f}" if s.currency == "USD" else f"¥{s.current_price:,.0f}"
+            lines.append(f"\n### {i}位 {s.company_name} ({s.ticker})")
+            lines.append(f"価格: {price_str}  上昇確率: **{s.rise_probability:.0f}%**")
+            lines.append(s.summary)
+    else:
+        lines.append("条件を満たす銘柄が見つかりませんでした。")
+    return lines
+
+
+def _format_reversal_section(stocks: list[StockAnalysis], label: str) -> list[str]:
+    lines = [f"## {label}"]
+    if stocks:
+        for s in stocks:
+            price_str = f"${s.current_price:,.2f}" if s.currency == "USD" else f"¥{s.current_price:,.0f}"
+            lines.append(
+                f"\n**{s.company_name}** ({s.ticker})  {price_str}  上昇確率: {s.rise_probability:.0f}%"
+            )
+            lines.append(f"  → {s.summary}")
+            if s.signals:
+                lines.append(f"  主なシグナル: {s.signals[0]}")
+    else:
+        lines.append("現時点で反転シグナルの銘柄はありません。")
+    return lines
 
 
 def format_daily_report(
-    top_stocks: list[StockAnalysis],
-    reversal_stocks: list[StockAnalysis],
+    jp_top: list[StockAnalysis],
+    jp_reversal: list[StockAnalysis],
+    us_top: list[StockAnalysis] = None,
+    us_reversal: list[StockAnalysis] = None,
 ) -> str:
-    """毎日の朝レポートをフォーマット"""
+    """毎日の朝レポートをフォーマット（日本株＋米株）"""
     from datetime import datetime
 
     today = datetime.now().strftime("%Y年%m月%d日")
-    lines = [
-        f"# 📊 低位株デイリーレポート [{today}]",
-        "",
-        "---",
-        "## 🚀 本日の注目低位株 TOP（上昇確率順）",
-    ]
+    lines = [f"# 📊 デイリーレポート [{today}]", ""]
 
-    if top_stocks:
-        for i, stock in enumerate(top_stocks, 1):
-            lines.append(f"\n### {i}位 {stock.company_name} ({stock.ticker})")
-            lines.append(
-                f"価格: ¥{stock.current_price:,.0f}  "
-                f"上昇確率: **{stock.rise_probability:.0f}%**"
-            )
-            lines.append(stock.summary)
-    else:
-        lines.append("条件を満たす銘柄が見つかりませんでした。")
+    lines += ["---"] + _format_stock_section(jp_top, "🇯🇵 注目日本株 TOP（上昇確率順）")
+    lines += ["", "---"] + _format_reversal_section(jp_reversal, "🇯🇵 日本株 反転シグナル検出銘柄")
 
-    lines += [
-        "",
-        "---",
-        "## 🔄 反転シグナル検出銘柄",
-    ]
+    if us_top is not None:
+        lines += ["", "---"] + _format_stock_section(us_top, "🇺🇸 注目米株 TOP（上昇確率順）")
+    if us_reversal is not None:
+        lines += ["", "---"] + _format_reversal_section(us_reversal, "🇺🇸 米株 反転シグナル検出銘柄")
 
-    if reversal_stocks:
-        for stock in reversal_stocks:
-            lines.append(
-                f"\n**{stock.company_name}** ({stock.ticker})  "
-                f"¥{stock.current_price:,.0f}  "
-                f"上昇確率: {stock.rise_probability:.0f}%"
-            )
-            lines.append(f"  → {stock.summary}")
-            if stock.signals:
-                lines.append(f"  主なシグナル: {stock.signals[0]}")
-    else:
-        lines.append("現時点で反転シグナルの銘柄はありません。")
-
-    lines += [
-        "",
-        "---",
-        "⚠️ *本レポートは自動分析です。投資の最終判断はご自身でお願いします。*",
-    ]
-
+    lines += ["", "---", "⚠️ *本レポートは自動分析です。投資の最終判断はご自身でお願いします。*"]
     return "\n".join(lines)

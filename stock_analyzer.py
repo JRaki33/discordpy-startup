@@ -32,6 +32,11 @@ SIGNAL_DEFS: dict[str, tuple[int, str, str]] = {
 }
 
 
+def is_us_stock(ticker: str) -> bool:
+    """`.T` で終わらないティッカーを米株と判定"""
+    return not ticker.upper().endswith(".T")
+
+
 @dataclass
 class StockAnalysis:
     ticker: str
@@ -48,6 +53,8 @@ class StockAnalysis:
     bb_position: str              # "lower" / "middle" / "upper"
     trend: str                    # "uptrend" / "downtrend" / "sideways"
     volume_surge: bool
+    market: str = "JP"            # "JP" or "US"
+    currency: str = "JPY"         # "JPY" or "USD"
 
 
 def fetch_stock_data(ticker: str, period_days: int = 120) -> Optional[pd.DataFrame]:
@@ -115,6 +122,9 @@ def analyze_stock(
     """
     if weights is None:
         weights = {}
+
+    market = "US" if is_us_stock(ticker) else "JP"
+    currency = "USD" if market == "US" else "JPY"
 
     df = fetch_stock_data(ticker)
     if df is None:
@@ -267,6 +277,8 @@ def analyze_stock(
         bb_position=bb_position,
         trend=trend,
         volume_surge=volume_surge,
+        market=market,
+        currency=currency,
     )
 
 
@@ -275,9 +287,16 @@ def format_analysis(analysis: StockAnalysis, show_weights: Optional[dict[str, fl
     change_arrow = "▲" if analysis.change_pct >= 0 else "▼"
     trend_map = {"uptrend": "上昇トレンド📈", "downtrend": "下降トレンド📉", "sideways": "横ばい↔️"}
 
+    if analysis.currency == "USD":
+        price_str = f"${analysis.current_price:,.2f}"
+        market_flag = "🇺🇸 米株"
+    else:
+        price_str = f"¥{analysis.current_price:,.0f}"
+        market_flag = "🇯🇵 日本株"
+
     lines = [
-        f"**{analysis.company_name}** ({analysis.ticker})",
-        f"現在値: ¥{analysis.current_price:,.0f}  {change_arrow}{abs(analysis.change_pct):.2f}%",
+        f"**{analysis.company_name}** ({analysis.ticker})  {market_flag}",
+        f"現在値: {price_str}  {change_arrow}{abs(analysis.change_pct):.2f}%",
         f"トレンド: {trend_map.get(analysis.trend, '-')}",
         "",
         "**📊 テクニカル指標**",
