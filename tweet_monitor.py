@@ -9,7 +9,7 @@ Usage:
     python tweet_monitor.py
 
 Required environment variables (set in .env):
-    ANTHROPIC_API_KEY - Anthropic API key
+    GEMINI_API_KEY - Google Gemini API key (free at https://aistudio.google.com/apikey)
 """
 
 import asyncio
@@ -23,8 +23,8 @@ from logging.handlers import RotatingFileHandler
 from typing import Dict, List, Optional
 
 import aiohttp
-import anthropic
 import feedparser
+import google.generativeai as genai
 from dotenv import load_dotenv
 from plyer import notification
 
@@ -75,7 +75,7 @@ def load_config(path: str = 'config.json') -> Dict:
 
     config.setdefault('check_interval_seconds', 10)
     config.setdefault('max_tweets_per_check', 5)
-    config.setdefault('claude_model', 'claude-haiku-4-5-20251001')
+    config.setdefault('gemini_model', 'gemini-2.0-flash')
     config.setdefault('dedup_store_path', 'processed_tweets.json')
     config.setdefault('dedup_max_ids', 10000)
     config.setdefault('nitter_instances', NITTER_INSTANCES)
@@ -174,70 +174,63 @@ def extract_tweet_text(entry: feedparser.FeedParserDict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Claude analysis
+# Gemini analysis
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are a financial analyst assistant specialized in identifying market-moving information.
+ANALYSIS_PROMPT = """You are a financial analyst assistant specialized in identifying market-moving information.
 
-Your task: analyze a tweet and determine whether it is likely to affect the stock price of any publicly traded company.
+Analyze the following tweet and determine whether it is likely to affect the stock price of any publicly traded company.
 
 Respond ONLY with a valid JSON object in this exact format:
-{
+{{
   "affects_stock": true or false,
   "confidence": "high", "medium", or "low",
   "ticker_symbols": ["TSLA", "AAPL"],
   "reason": "One sentence explanation"
-}
+}}
 
 Guidelines:
 - "affects_stock" is true if the tweet contains: product announcements, earnings hints, regulatory news, leadership changes, major contracts, acquisitions, mergers, lawsuits, financial results, or strong positive/negative sentiment about a company's business.
 - "affects_stock" is false for: personal opinions unrelated to business, sports, food, general politics with no specific company impact, jokes, or routine social posts.
 - Only include ticker symbols you are highly confident about.
-- Keep "reason" to one concise sentence."""
+- Keep "reason" to one concise sentence.
+
+Twitter account: @{username} ({display_name})
+Tweet text: {tweet_text}"""
 
 
 async def analyze_tweet(
-    client: anthropic.AsyncAnthropic,
+    gemini_model: genai.GenerativeModel,
     tweet_text: str,
     username: str,
     display_name: str,
     model: str
 ) -> Optional[Dict]:
-    user_message = (
-        f"Twitter account: @{username} ({display_name})\n"
-        f"Tweet text: {tweet_text[:1000]}"
+    prompt = ANALYSIS_PROMPT.format(
+        username=username,
+        display_name=display_name,
+        tweet_text=tweet_text[:1000]
     )
 
     try:
-        response = await client.messages.create(
-            model=model,
-            max_tokens=256,
-            system=[{
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"}
-            }],
-            messages=[{"role": "user", "content": user_message}]
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: gemini_model.generate_content(prompt)
         )
-
-        text = next(
-            (b.text for b in response.content if b.type == "text"),
-            None
-        )
-        if text is None:
-            logging.warning("Claude returned no text for tweet from @%s", username)
-            return None
-
-        return json.loads(text)
+        text = response.text.strip()
+        # Strip markdown code fences if present
+        if text.startswith('```'):
+            text = text.split('```')[1]
+            if text.startswith('json'):
+                text = text[4:]
+        return json.loads(text.strip())
 
     except json.JSONDecodeError as e:
-        logging.warning("Claude returned invalid JSON for @%s tweet: %s", username, e)
-        return None
-    except anthropic.RateLimitError:
-        logging.warning("Anthropic rate limit hit, skipping tweet from @%s", username)
+        logging.warning("Gemini returned invalid JSON for @%s tweet: %s", username, e)
         return None
     except Exception as e:
-        logging.warning("Claude analysis failed for @%s: %s", username, e)
+        logging.warning("Gemini analysis failed for @%s: %s", username, e)
         return None
 
 
@@ -275,7 +268,7 @@ def send_desktop_notification(tweet_text: str, username: str, analysis: Dict) ->
 
 async def check_account(
     session: aiohttp.ClientSession,
-    anthropic_client: anthropic.AsyncAnthropic,
+    gemini_model: genai.GenerativeModel,
     account: Dict,
     processed_ids: deque,
     config: Dict
@@ -314,11 +307,11 @@ async def check_account(
         )
 
         analysis = await analyze_tweet(
-            anthropic_client,
+            gemini_model,
             tweet_text,
             username,
             display_name,
-            config['claude_model']
+            config['gemini_model']
         )
 
         if analysis is None:
@@ -348,11 +341,15 @@ async def check_account(
 async def run_monitor_loop(config: Dict) -> None:
     load_dotenv()
 
-    anthropic_api_key = os.environ.get('ANTHROPIC_API_KEY', '')
-    if not anthropic_api_key:
-        raise EnvironmentError("Missing ANTHROPIC_API_KEY. Set it in .env")
+    gemini_api_key = os.environ.get('GEMINI_API_KEY', '')
+    if not gemini_api_key:
+        raise EnvironmentError(
+            "Missing GEMINI_API_KEY. Set it in .env "
+            "(get one free at https://aistudio.google.com/apikey)"
+        )
 
-    anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
+    genai.configure(api_key=gemini_api_key)
+    gemini_model = genai.GenerativeModel(config['gemini_model'])
 
     dedup_path = config['dedup_store_path']
     processed_ids = load_processed_ids(dedup_path, config['dedup_max_ids'])
@@ -376,7 +373,7 @@ async def run_monitor_loop(config: Dict) -> None:
                 for account in accounts:
                     new_ids = await check_account(
                         session,
-                        anthropic_client,
+                        gemini_model,
                         account,
                         processed_ids,
                         config
