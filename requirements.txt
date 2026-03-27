@@ -1,5 +1,6 @@
 discord.py[voice]>=1.4.1
 anthropic>=0.40.0
-twikit>=2.0.0
+aiohttp>=3.9.0
+feedparser>=6.0.0
 plyer>=2.1.0
 python-dotenv>=1.0.0

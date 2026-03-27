@@ -1,15 +1,14 @@
 """
 Tweet Stock Price Alert Monitor
-Monitors specific Twitter/X accounts and sends desktop notifications
-when a tweet is likely to affect stock prices.
+Monitors specific Twitter/X accounts via Nitter RSS feeds and sends desktop
+notifications when a tweet is likely to affect stock prices.
+
+No Twitter account or API key needed — uses public Nitter instances.
 
 Usage:
     python tweet_monitor.py
 
 Required environment variables (set in .env):
-    TWITTER_USERNAME  - Twitter username or email
-    TWITTER_EMAIL     - Twitter email address
-    TWITTER_PASSWORD  - Twitter password
     ANTHROPIC_API_KEY - Anthropic API key
 """
 
@@ -21,13 +20,27 @@ import sys
 from collections import deque
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 
+import aiohttp
 import anthropic
+import feedparser
 from dotenv import load_dotenv
 from plyer import notification
-from twikit import Client as TwitterClient
-from twikit.errors import TweetLimitExceeded, TwitterException
+
+# ---------------------------------------------------------------------------
+# Nitter public instances (tried in order, with fallback)
+# ---------------------------------------------------------------------------
+
+NITTER_INSTANCES = [
+    "nitter.poast.org",
+    "nitter.privacyredirect.com",
+    "nitter.nixnet.services",
+    "nitter.1d4.us",
+    "nitter.fdn.fr",
+    "nitter.unixfox.eu",
+    "lightbrd.com",
+]
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -60,11 +73,13 @@ def load_config(path: str = 'config.json') -> Dict:
     if 'accounts' not in config or not config['accounts']:
         raise ValueError("config.json must contain a non-empty 'accounts' list")
 
-    config.setdefault('check_interval_seconds', 300)
+    config.setdefault('check_interval_seconds', 10)
     config.setdefault('max_tweets_per_check', 5)
     config.setdefault('claude_model', 'claude-haiku-4-5-20251001')
     config.setdefault('dedup_store_path', 'processed_tweets.json')
     config.setdefault('dedup_max_ids', 10000)
+    config.setdefault('nitter_instances', NITTER_INSTANCES)
+    config.setdefault('fetch_timeout_seconds', 15)
     return config
 
 
@@ -97,24 +112,65 @@ def save_processed_ids(ids: deque, path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Twitter client
+# Nitter RSS fetching
 # ---------------------------------------------------------------------------
 
-async def get_twitter_client(username: str, email: str, password: str) -> TwitterClient:
-    client = TwitterClient('en-US')
-    try:
-        client.load_cookies('cookies.json')
-        logging.info("Loaded Twitter cookies from cookies.json")
-    except FileNotFoundError:
-        logging.info("No cookies found, logging in to Twitter...")
-        await client.login(
-            auth_info_1=username,
-            auth_info_2=email,
-            password=password
-        )
-        client.save_cookies('cookies.json')
-        logging.info("Twitter login successful, cookies saved")
-    return client
+async def fetch_rss(
+    session: aiohttp.ClientSession,
+    username: str,
+    instances: List[str],
+    timeout: int
+) -> Optional[feedparser.FeedParserDict]:
+    """Try each Nitter instance in order and return the first successful RSS feed."""
+    for instance in instances:
+        url = f"https://{instance}/{username}/rss"
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                headers={"User-Agent": "TweetStockMonitor/1.0 (RSS reader)"}
+            ) as resp:
+                if resp.status != 200:
+                    logging.debug(
+                        "Instance %s returned HTTP %d for @%s",
+                        instance, resp.status, username
+                    )
+                    continue
+                body = await resp.text()
+                feed = feedparser.parse(body)
+                if feed.bozo and not feed.entries:
+                    logging.debug(
+                        "Instance %s returned unparseable feed for @%s",
+                        instance, username
+                    )
+                    continue
+                logging.debug("Fetched RSS for @%s from %s", username, instance)
+                return feed
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logging.debug("Instance %s failed for @%s: %s", instance, username, e)
+
+    logging.warning("All Nitter instances failed for @%s", username)
+    return None
+
+
+def extract_tweet_id(entry_id: str) -> str:
+    """Extract numeric tweet ID from a Nitter RSS entry id URL."""
+    # entry.id is typically "https://nitter.instance/username/status/1234567890#m"
+    parts = entry_id.rstrip('#m').split('/')
+    for part in reversed(parts):
+        if part.isdigit():
+            return part
+    return entry_id  # fallback: use raw id
+
+
+def extract_tweet_text(entry: feedparser.FeedParserDict) -> str:
+    """Extract plain tweet text from an RSS entry."""
+    # feedparser puts content in entry.title or entry.summary
+    text = entry.get('title', '') or entry.get('summary', '')
+    # Remove leading "R to @user: " or "RT @user: " prefix
+    if text.startswith('RT @'):
+        return ''  # skip retweets
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +264,7 @@ def send_desktop_notification(tweet_text: str, username: str, analysis: Dict) ->
             app_name="TweetStockMonitor",
             timeout=15
         )
-        logging.info("Desktop notification sent for @%s tweet (%s)", username, ticker_str)
+        logging.info("Desktop notification sent for @%s (%s)", username, ticker_str)
     except Exception as e:
         logging.warning("Desktop notification failed: %s", e)
 
@@ -218,7 +274,7 @@ def send_desktop_notification(tweet_text: str, username: str, analysis: Dict) ->
 # ---------------------------------------------------------------------------
 
 async def check_account(
-    twitter_client: TwitterClient,
+    session: aiohttp.ClientSession,
     anthropic_client: anthropic.AsyncAnthropic,
     account: Dict,
     processed_ids: deque,
@@ -228,40 +284,34 @@ async def check_account(
     display_name = account.get('display_name', username)
     new_ids: List[str] = []
 
-    try:
-        user = await asyncio.wait_for(
-            twitter_client.get_user_by_screen_name(username),
-            timeout=30.0
-        )
-        tweets = await asyncio.wait_for(
-            user.get_tweets('Tweets', count=config['max_tweets_per_check']),
-            timeout=30.0
-        )
-    except asyncio.TimeoutError:
-        logging.warning("Timeout fetching tweets from @%s", username)
-        return new_ids
-    except TweetLimitExceeded:
-        logging.warning("Rate limited fetching tweets from @%s", username)
-        return new_ids
-    except TwitterException as e:
-        logging.warning("Twitter error for @%s: %s", username, e)
+    feed = await fetch_rss(
+        session,
+        username,
+        config['nitter_instances'],
+        config['fetch_timeout_seconds']
+    )
+    if feed is None:
         return new_ids
 
-    for tweet in tweets:
-        tweet_id = str(tweet.id)
+    entries = feed.entries[:config['max_tweets_per_check']]
+
+    for entry in entries:
+        tweet_id = extract_tweet_id(entry.get('id', ''))
 
         if tweet_id in processed_ids:
             continue
 
         new_ids.append(tweet_id)
-        tweet_text = getattr(tweet, 'full_text', '') or getattr(tweet, 'text', '') or ''
+        tweet_text = extract_tweet_text(entry)
 
-        # Skip retweets and empty tweets
-        if not tweet_text or tweet_text.startswith('RT @'):
+        if not tweet_text:
             logging.debug("Skipping RT or empty tweet %s from @%s", tweet_id, username)
             continue
 
-        logging.info("Analyzing tweet %s from @%s: %s", tweet_id, username, tweet_text[:80])
+        logging.info(
+            "Analyzing tweet %s from @%s: %s",
+            tweet_id, username, tweet_text[:80]
+        )
 
         analysis = await analyze_tweet(
             anthropic_client,
@@ -276,7 +326,7 @@ async def check_account(
 
         if analysis.get('affects_stock'):
             logging.info(
-                "Stock-impacting tweet detected from @%s: %s (confidence: %s)",
+                "Stock-impacting tweet from @%s: %s (confidence: %s)",
                 username,
                 analysis.get('reason', ''),
                 analysis.get('confidence', '')
@@ -285,9 +335,7 @@ async def check_account(
         else:
             logging.debug(
                 "Tweet %s from @%s: no stock impact (%s)",
-                tweet_id,
-                username,
-                analysis.get('reason', '')
+                tweet_id, username, analysis.get('reason', '')
             )
 
     return new_ids
@@ -300,24 +348,10 @@ async def check_account(
 async def run_monitor_loop(config: Dict) -> None:
     load_dotenv()
 
-    twitter_username = os.environ.get('TWITTER_USERNAME', '')
-    twitter_email = os.environ.get('TWITTER_EMAIL', '')
-    twitter_password = os.environ.get('TWITTER_PASSWORD', '')
     anthropic_api_key = os.environ.get('ANTHROPIC_API_KEY', '')
-
-    if not all([twitter_username, twitter_email, twitter_password]):
-        raise EnvironmentError(
-            "Missing Twitter credentials. Set TWITTER_USERNAME, TWITTER_EMAIL, "
-            "TWITTER_PASSWORD in .env"
-        )
     if not anthropic_api_key:
-        raise EnvironmentError(
-            "Missing ANTHROPIC_API_KEY. Set it in .env"
-        )
+        raise EnvironmentError("Missing ANTHROPIC_API_KEY. Set it in .env")
 
-    twitter_client = await get_twitter_client(
-        twitter_username, twitter_email, twitter_password
-    )
     anthropic_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
 
     dedup_path = config['dedup_store_path']
@@ -327,55 +361,37 @@ async def run_monitor_loop(config: Dict) -> None:
     interval: int = config['check_interval_seconds']
 
     logging.info(
-        "Monitoring started: %d accounts, interval=%ds",
+        "Monitoring started: %d accounts, interval=%ds, instances=%s",
         len(accounts),
-        interval
+        interval,
+        config['nitter_instances']
     )
 
     backoff = interval
 
-    while True:
-        try:
-            for account in accounts:
-                new_ids = await check_account(
-                    twitter_client,
-                    anthropic_client,
-                    account,
-                    processed_ids,
-                    config
-                )
-                for tid in new_ids:
-                    processed_ids.append(tid)
-
-            save_processed_ids(processed_ids, dedup_path)
-            backoff = interval
-
-        except TwitterException as e:
-            # Re-auth if cookies expired
-            if 'auth' in str(e).lower() or '32' in str(e) or '89' in str(e):
-                logging.warning("Twitter auth error, clearing cookies and retrying: %s", e)
-                try:
-                    os.remove('cookies.json')
-                except FileNotFoundError:
-                    pass
-                try:
-                    twitter_client = await get_twitter_client(
-                        twitter_username, twitter_email, twitter_password
+    connector = aiohttp.TCPConnector(ssl=True)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        while True:
+            try:
+                for account in accounts:
+                    new_ids = await check_account(
+                        session,
+                        anthropic_client,
+                        account,
+                        processed_ids,
+                        config
                     )
-                except Exception as login_err:
-                    logging.error("Re-login failed: %s", login_err)
-                    backoff = min(backoff * 2, 1800)
-            else:
-                logging.warning(
-                    "Twitter error, backing off %ds: %s", backoff, e
-                )
+                    for tid in new_ids:
+                        processed_ids.append(tid)
+
+                save_processed_ids(processed_ids, dedup_path)
+                backoff = interval
+
+            except Exception as e:
+                logging.error("Unexpected error in monitor loop: %s", e)
                 backoff = min(backoff * 2, 1800)
 
-        except Exception as e:
-            logging.error("Unexpected error in monitor loop: %s", e)
-            backoff = min(backoff * 2, 1800)
-
-        await asyncio.sleep(backoff)
+            await asyncio.sleep(backoff)
 
 
 # ---------------------------------------------------------------------------
