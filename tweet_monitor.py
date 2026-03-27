@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 
 import aiohttp
 import feedparser
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 from plyer import notification
 
@@ -200,7 +200,7 @@ Tweet text: {tweet_text}"""
 
 
 async def analyze_tweet(
-    gemini_model: genai.GenerativeModel,
+    gemini_client: genai.Client,
     tweet_text: str,
     username: str,
     display_name: str,
@@ -216,7 +216,7 @@ async def analyze_tweet(
         loop = asyncio.get_event_loop()
         response = await loop.run_in_executor(
             None,
-            lambda: gemini_model.generate_content(prompt)
+            lambda: gemini_client.models.generate_content(model=model, contents=prompt)
         )
         text = response.text.strip()
         # Strip markdown code fences if present
@@ -348,8 +348,8 @@ async def run_monitor_loop(config: Dict) -> None:
             "(get one free at https://aistudio.google.com/apikey)"
         )
 
-    genai.configure(api_key=gemini_api_key)
-    gemini_model = genai.GenerativeModel(config['gemini_model'])
+    gemini_client = genai.Client(api_key=gemini_api_key)
+    gemini_model = gemini_client
 
     dedup_path = config['dedup_store_path']
     processed_ids = load_processed_ids(dedup_path, config['dedup_max_ids'])
