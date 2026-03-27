@@ -3,28 +3,24 @@ Tweet Stock Price Alert Monitor
 Monitors specific Twitter/X accounts via Nitter RSS feeds and sends desktop
 notifications when a tweet is likely to affect stock prices.
 
-No Twitter account or API key needed — uses public Nitter instances.
+No API key needed — uses keyword matching for stock impact detection.
 
 Usage:
     python tweet_monitor.py
-
-Required environment variables (set in .env):
-    GEMINI_API_KEY - Google Gemini API key (free at https://aistudio.google.com/apikey)
 """
 
 import asyncio
 import json
 import logging
-import os
+import re
 import sys
 from collections import deque
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 import feedparser
-from google import genai
 from dotenv import load_dotenv
 from plyer import notification
 
@@ -75,7 +71,6 @@ def load_config(path: str = 'config.json') -> Dict:
 
     config.setdefault('check_interval_seconds', 10)
     config.setdefault('max_tweets_per_check', 5)
-    config.setdefault('gemini_model', 'gemini-2.0-flash')
     config.setdefault('dedup_store_path', 'processed_tweets.json')
     config.setdefault('dedup_max_ids', 10000)
     config.setdefault('nitter_instances', NITTER_INSTANCES)
@@ -174,80 +169,65 @@ def extract_tweet_text(entry: feedparser.FeedParserDict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Gemini analysis
+# Keyword-based stock impact detection (no API needed)
 # ---------------------------------------------------------------------------
 
-ANALYSIS_PROMPT = """You are a financial analyst assistant specialized in identifying market-moving information.
+# High-confidence keywords that strongly indicate stock price impact
+STOCK_KEYWORDS = [
+    # Earnings & financials
+    r'\bearnings\b', r'\brevenue\b', r'\bprofit\b', r'\bloss\b',
+    r'\bguidance\b', r'\bforecast\b', r'\boutlook\b', r'\bEPS\b',
+    r'\bbeat\b', r'\bmiss\b', r'\bquarterly\b', r'\bannual results\b',
+    # M&A
+    r'\bacquisition\b', r'\bmerger\b', r'\bbuyout\b', r'\btakeover\b',
+    r'\bacquires?\b', r'\bmerges?\b',
+    # Market events
+    r'\bIPO\b', r'\boffering\b', r'\bdilution\b', r'\bbuyback\b',
+    r'\bdividend\b', r'\bsplit\b',
+    # Negative events
+    r'\bbankruptcy\b', r'\bdefault\b', r'\blayoff\b', r'\blayoffs\b',
+    r'\brecall\b', r'\bshutdown\b', r'\bfraud\b', r'\bscandal\b',
+    # Regulatory / legal
+    r'\bSEC\b', r'\blawsuit\b', r'\bsettlement\b', r'\bfine\b',
+    r'\bpenalty\b', r'\bregulat\w+\b', r'\bapproval\b', r'\bban\b',
+    # Leadership
+    r'\bCEO\b', r'\bCFO\b', r'\bresign\w*\b', r'\bfired\b',
+    r'\bappointed\b', r'\bsteps down\b',
+    # Macro / Fed
+    r'\bFed\b', r'\brate hike\b', r'\brate cut\b', r'\binterest rate\b',
+    r'\binflation\b', r'\bCPI\b', r'\bGDP\b', r'\brecession\b',
+    # Trade / geopolitics affecting markets
+    r'\btariff\b', r'\bsanction\w*\b', r'\btrade war\b', r'\bembargo\b',
+    r'\boil\b', r'\bcrude\b', r'\bOPEC\b',
+    # Stock tickers (e.g. $TSLA)
+    r'\$[A-Z]{1,5}\b',
+]
 
-Analyze the following tweet and determine whether it is likely to affect the stock price of any publicly traded company.
-
-Respond ONLY with a valid JSON object in this exact format:
-{{
-  "affects_stock": true or false,
-  "confidence": "high", "medium", or "low",
-  "ticker_symbols": ["TSLA", "AAPL"],
-  "reason": "One sentence explanation"
-}}
-
-Guidelines:
-- "affects_stock" is true if the tweet contains: product announcements, earnings hints, regulatory news, leadership changes, major contracts, acquisitions, mergers, lawsuits, financial results, or strong positive/negative sentiment about a company's business.
-- "affects_stock" is false for: personal opinions unrelated to business, sports, food, general politics with no specific company impact, jokes, or routine social posts.
-- Only include ticker symbols you are highly confident about.
-- Keep "reason" to one concise sentence.
-
-Twitter account: @{username} ({display_name})
-Tweet text: {tweet_text}"""
+_COMPILED = [re.compile(p, re.IGNORECASE) for p in STOCK_KEYWORDS]
 
 
-async def analyze_tweet(
-    gemini_client: genai.Client,
-    tweet_text: str,
-    username: str,
-    display_name: str,
-    model: str
-) -> Optional[Dict]:
-    prompt = ANALYSIS_PROMPT.format(
-        username=username,
-        display_name=display_name,
-        tweet_text=tweet_text[:1000]
-    )
-
-    try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            None,
-            lambda: gemini_client.models.generate_content(model=model, contents=prompt)
+def analyze_tweet(tweet_text: str) -> Tuple[bool, str]:
+    """
+    Returns (affects_stock, reason).
+    No API call needed — pure keyword matching.
+    """
+    matched = [p.pattern for p in _COMPILED if p.search(tweet_text)]
+    if matched:
+        # Clean up the pattern for display
+        keywords = ', '.join(
+            re.sub(r'\\b|\\w\+|\(\?i\)', '', m).strip('()').replace('\\', '')
+            for m in matched[:3]
         )
-        text = response.text.strip()
-        # Strip markdown code fences if present
-        if text.startswith('```'):
-            text = text.split('```')[1]
-            if text.startswith('json'):
-                text = text[4:]
-        return json.loads(text.strip())
-
-    except json.JSONDecodeError as e:
-        logging.warning("Gemini returned invalid JSON for @%s tweet: %s", username, e)
-        return None
-    except Exception as e:
-        logging.warning("Gemini analysis failed for @%s: %s", username, e)
-        return None
+        return True, f"Contains market keywords: {keywords}"
+    return False, "No stock-related keywords found"
 
 
 # ---------------------------------------------------------------------------
 # Desktop notification
 # ---------------------------------------------------------------------------
 
-def send_desktop_notification(tweet_text: str, username: str, analysis: Dict) -> None:
-    tickers = analysis.get('ticker_symbols', [])
-    ticker_str = ', '.join(tickers) if tickers else 'ticker unknown'
-    confidence = analysis.get('confidence', '')
-    reason = analysis.get('reason', '')
-
-    title = f"Stock Alert: @{username} [{ticker_str}]"
-    if confidence:
-        title += f" ({confidence})"
-
+def send_desktop_notification(tweet_text: str, username: str, reason: str) -> None:
+    title = f"Stock Alert: @{username}"
     message = f"{reason}\n\n{tweet_text[:200]}"
 
     try:
@@ -257,7 +237,7 @@ def send_desktop_notification(tweet_text: str, username: str, analysis: Dict) ->
             app_name="TweetStockMonitor",
             timeout=15
         )
-        logging.info("Desktop notification sent for @%s (%s)", username, ticker_str)
+        logging.info("Desktop notification sent for @%s", username)
     except Exception as e:
         logging.warning("Desktop notification failed: %s", e)
 
@@ -268,7 +248,6 @@ def send_desktop_notification(tweet_text: str, username: str, analysis: Dict) ->
 
 async def check_account(
     session: aiohttp.ClientSession,
-    gemini_model: genai.GenerativeModel,
     account: Dict,
     processed_ids: deque,
     config: Dict
@@ -306,30 +285,13 @@ async def check_account(
             tweet_id, username, tweet_text[:80]
         )
 
-        analysis = await analyze_tweet(
-            gemini_model,
-            tweet_text,
-            username,
-            display_name,
-            config['gemini_model']
-        )
+        affects_stock, reason = analyze_tweet(tweet_text)
 
-        if analysis is None:
-            continue
-
-        if analysis.get('affects_stock'):
-            logging.info(
-                "Stock-impacting tweet from @%s: %s (confidence: %s)",
-                username,
-                analysis.get('reason', ''),
-                analysis.get('confidence', '')
-            )
-            send_desktop_notification(tweet_text, username, analysis)
+        if affects_stock:
+            logging.info("Stock-impacting tweet from @%s: %s", username, reason)
+            send_desktop_notification(tweet_text, username, reason)
         else:
-            logging.debug(
-                "Tweet %s from @%s: no stock impact (%s)",
-                tweet_id, username, analysis.get('reason', '')
-            )
+            logging.debug("Tweet %s from @%s: no stock impact", tweet_id, username)
 
     return new_ids
 
@@ -340,16 +302,6 @@ async def check_account(
 
 async def run_monitor_loop(config: Dict) -> None:
     load_dotenv()
-
-    gemini_api_key = os.environ.get('GEMINI_API_KEY', '')
-    if not gemini_api_key:
-        raise EnvironmentError(
-            "Missing GEMINI_API_KEY. Set it in .env "
-            "(get one free at https://aistudio.google.com/apikey)"
-        )
-
-    gemini_client = genai.Client(api_key=gemini_api_key)
-    gemini_model = gemini_client
 
     dedup_path = config['dedup_store_path']
     processed_ids = load_processed_ids(dedup_path, config['dedup_max_ids'])
@@ -373,7 +325,6 @@ async def run_monitor_loop(config: Dict) -> None:
                 for account in accounts:
                     new_ids = await check_account(
                         session,
-                        gemini_model,
                         account,
                         processed_ids,
                         config
