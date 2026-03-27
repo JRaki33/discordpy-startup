@@ -102,3 +102,8 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Tweet monitor - secrets and runtime files
+cookies.json
+processed_tweets.json
+tweet_monitor.log*
