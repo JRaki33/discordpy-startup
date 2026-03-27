@@ -8,5 +8,6 @@
   "max_tweets_per_check": 5,
   "claude_model": "claude-haiku-4-5-20251001",
   "dedup_store_path": "processed_tweets.json",
-  "dedup_max_ids": 10000
+  "dedup_max_ids": 10000,
+  "nitter_instances": ["nitter.net"]
 }
